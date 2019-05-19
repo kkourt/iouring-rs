@@ -1,0 +1,4 @@
+/target
+**/*.rs.bk
+Cargo.lock
+scripts/print_syscall_nums

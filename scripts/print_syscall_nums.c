@@ -7,7 +7,7 @@
 #include <stdio.h>
 
 #define PR_SYSCALL_NR(x) do {                                              \
-    printf("pub const SYS_%s: ::c_long = %ld;\n", #x, (long)(__NR_ ##x));  \
+    printf("pub const SYS_%s: c_long = %ld;\n", #x, (long)(__NR_ ##x));  \
 } while (0)                                                                \
 
 int main(int argc, char *argv[])
