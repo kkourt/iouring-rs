@@ -32,40 +32,43 @@ fn mmap(len: libc::size_t, fd: libc::c_int, off: libc::off_t) -> *mut libc::c_vo
     }
 }
 
-#[repr(C)]
-struct io_uring_sq {
-    khead: *mut libc::c_uint,
-    ktail: *mut libc::c_uint,
-    kring_masks: *mut libc::c_uint,
-    kring_entries: *mut libc::c_uint,
-    kflags: *mut libc::c_uint,
-    kdropped: *mut libc::c_uint,
-    array: *mut libc::c_uint,
+/// Submission queue
+struct SQ {
+    khead: *mut u32,
+    ktail: *mut u32,
+    kring_mask: *mut u32,
+    kring_entries: *mut u32,
+    kflags: *mut u32,
+    kdropped: *mut u32,
+    array: *mut u32,
 
     sqes: *mut io_uring_sqe,
-    sqe_head: libc::c_uint,
-    sqe_tail: libc::c_uint,
+    sqe_head: u32,
+    sqe_tail: u32,
 
     ring_sz: libc::size_t,
     ring_ptr: *mut libc::c_void,
 }
 
-impl io_uring_sq {
-    fn empty() -> io_uring_sq {
-        unsafe { std::mem::zeroed() }
-    }
+/// Completion queue
+struct CQ {
+    khead: *mut u32,
+    ktail: *mut u32,
+    kring_mask: *mut u32,
+    kring_entries: *mut u32,
+    overflow: *mut u32,
 
-    fn sques_size(&self) -> libc::size_t {
-        let nentries_ = unsafe { *self.kring_entries };
-        let nentries = libc::size_t::try_from(nentries_).unwrap();
-        let esz = libc::size_t::try_from(mem::size_of::<io_uring_sqe>()).unwrap();
-        nentries*esz
-    }
+    cqes: *mut io_uring_sqe,
+
+    ring_sz: libc::size_t,
+    ring_ptr: *mut libc::c_void,
 }
+
 
 pub struct IoUring {
     fd: libc::c_int,
-    sq: io_uring_sq,
+    sq: SQ,
+    cq: CQ,
 }
 
 type KernelRwf = libc::c_int;
@@ -98,6 +101,12 @@ struct io_uring_sqe {
     idx: io_uring_sqe_idx,
 }
 
+#[repr(C)]
+struct io_uring_cqe {
+    user_data: u64,   /* sqe->data submission passed back */
+    res: i32,         /* result code for this event */
+    flags: u32,
+}
 
 
 #[repr(C)]
@@ -135,14 +144,6 @@ struct io_uring_params {
     resv: [u32; 5],
     sq_off: io_sqring_offsets,
     cq_off: io_cqring_offsets,
-}
-
-impl io_uring_params {
-    fn get_sq_ring_size(&self) -> libc::size_t {
-        let s1 = self.sq_off.array as libc::size_t;
-        let s2 = (self.sq_entries as libc::size_t) * mem::size_of::<libc::c_uint>();
-        s1 + s2
-    }
 }
 
 unsafe fn io_uring_register(
@@ -202,7 +203,8 @@ impl IoUring {
 
         let mut ret : IoUring = IoUring {
             fd: fd,
-            sq: io_uring_sq::empty()
+            sq: unsafe { std::mem::zeroed() },
+            cq: unsafe { std::mem::zeroed() },
         };
 
         let err = ret.queue_mmap(&mut params);
@@ -216,36 +218,113 @@ impl IoUring {
 
     fn queue_mmap(&mut self, p: &mut io_uring_params) -> io::Result<()> {
 
+        // convinience function for computing pointer offsets
         let ptr_off = |p: *const libc::c_void, off: u32| -> *mut libc::c_uint {
             let mut ptr = p as libc::uintptr_t;
             ptr += libc::uintptr_t::try_from(off).unwrap();
             ptr as *mut libc::c_uint
         };
 
-        let mut ring : IoUring = unsafe { std::mem::zeroed() };
+        /*
+         * mmap submission queue
+         */
+        let sq = &mut self.sq;
 
-        let sq = &mut ring.sq;
-        sq.ring_sz  = p.get_sq_ring_size();
-        sq.ring_ptr = mmap(sq.ring_sz, self.fd, IORING_OFF_SQ_RING);
-        if sq.ring_ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error())
-        }
-        sq.khead         = ptr_off(sq.ring_ptr, p.sq_off.head);
-        sq.ktail         = ptr_off(sq.ring_ptr, p.sq_off.tail);
-        sq.kring_masks   = ptr_off(sq.ring_ptr, p.sq_off.ring_mask);
-        sq.kring_entries = ptr_off(sq.ring_ptr, p.sq_off.ring_entries);
-        sq.kflags        = ptr_off(sq.ring_ptr, p.sq_off.flags);
-        sq.kdropped      = ptr_off(sq.ring_ptr, p.sq_off.dropped);
-        sq.array         = ptr_off(sq.ring_ptr, p.sq_off.array);
-        sq.sqes          = {
-            let sqp = mmap(sq.sques_size(), self.fd, IORING_OFF_SQES);
+        // The addition of sq_off.array to the length of the region accounts for the fact that the
+        // ring located at the end of the data structure.
+        let sq_ring_sz  = {
+            let s1 = libc::size_t::try_from(p.sq_off.array).unwrap();
+            let s2 = libc::size_t::try_from(p.sq_entries).unwrap() * mem::size_of::<u32>();
+            s1 + s2
+        };
+
+        // mmap the submission queue structure
+        let sq_ring_ptr = {
+            let ptr = mmap(sq_ring_sz, self.fd, IORING_OFF_SQ_RING);
+            if ptr == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error())
+            }
+            ptr
+        };
+
+        let sqes_size = {
+            let nentries = libc::size_t::try_from(p.sq_entries).unwrap();
+            let esz = libc::size_t::try_from(mem::size_of::<io_uring_sqe>()).unwrap();
+            nentries*esz
+        };
+
+        // mmap the submission queue entries array
+        let sqes_ptr = {
+            let sqp = mmap(sqes_size, self.fd, IORING_OFF_SQES);
             if sqp == libc::MAP_FAILED {
-                unsafe { libc::munmap(sq.ring_ptr, sq.ring_sz) };
+                unsafe { libc::munmap(sq_ring_ptr, sq_ring_sz) };
                 return Err(io::Error::last_os_error());
             }
             sqp as *mut io_uring_sqe
         };
 
-        unimplemented!()
+        // initialize the SQ structure
+        // setup pointers to submission queue structure using the sq offsets
+        *sq = {
+            let ptr = sq_ring_ptr;
+            let off : &io_sqring_offsets = &p.sq_off;
+            SQ {
+                khead         : ptr_off(ptr, off.head),
+                ktail         : ptr_off(ptr, off.tail),
+                kring_mask    : ptr_off(ptr, off.ring_mask),
+                kring_entries : ptr_off(ptr, off.ring_entries),
+                kflags        : ptr_off(ptr, off.flags),
+                kdropped      : ptr_off(ptr, off.dropped),
+                array         : ptr_off(ptr, off.array),
+                sqes          : sqes_ptr,
+                sqe_head      : 0,
+                sqe_tail      : 0,
+                ring_sz       : sq_ring_sz,
+                ring_ptr      : ptr,
+            }
+        };
+
+        // these two have to be the same so that the unmap when closing io_uring works properly
+        assert_eq!(p.sq_entries, unsafe { *sq.kring_entries });
+
+        /*
+         * mmap completion queue
+         */
+        let cq = &mut self.cq;
+
+        let cq_ring_sz = {
+            let s1 = libc::size_t::try_from(p.cq_off.cqes).unwrap();
+            let s2 = libc::size_t::try_from(p.cq_entries).unwrap() * mem::size_of::<io_uring_cqe>();
+            s1 + s2
+        };
+
+        let cq_ring_ptr  = {
+            let ptr = mmap(cq_ring_sz, self.fd, IORING_OFF_CQ_RING);
+            if ptr == libc::MAP_FAILED {
+                unsafe {
+                    libc::munmap(sq_ring_ptr, sq_ring_sz);
+                    libc::munmap(sqes_ptr as *mut libc::c_void, sqes_size);
+                }
+                return Err(io::Error::last_os_error())
+            }
+            ptr
+        };
+
+        *cq = {
+            let ptr = cq_ring_ptr;
+            let off : &io_cqring_offsets = &p.cq_off;
+            CQ {
+                khead: ptr_off(ptr, off.head),
+                ktail: ptr_off(ptr, off.tail),
+                kring_mask: ptr_off(ptr, off.ring_mask),
+                kring_entries: ptr_off(ptr, off.ring_entries),
+                overflow: ptr_off(ptr, off.overflow),
+                cqes: ptr_off(ptr, off.cqes) as *mut io_uring_sqe,
+                ring_sz: cq_ring_sz,
+                ring_ptr: ptr
+            }
+        };
+
+        Ok(())
     }
 }
