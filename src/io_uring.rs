@@ -19,18 +19,8 @@ use crate::kernel_abi::{
  * Magic offsets for the application to mmap the data it needs
  */
 const IORING_OFF_SQ_RING: i64 = 0;
-const IORING_OFF_CQ_RING: i64 = 0x8000000;
+const IORING_OFF_CQ_RING: i64 = 0x08000000;
 const IORING_OFF_SQES:    i64 = 0x10000000;
-
-/// mmap helper
-fn mmap(len: libc::size_t, fd: libc::c_int, off: libc::off_t) -> *mut libc::c_void {
-    let prot  = libc::PROT_READ | libc::PROT_WRITE;
-    let flags = libc::MAP_SHARED | libc::MAP_POPULATE;
-    let null = 0 as *mut libc::c_void;
-    unsafe {
-        libc::mmap(null, len, prot, flags, fd, off)
-    }
-}
 
 /// Submission queue
 struct SQ {
@@ -65,6 +55,7 @@ struct CQ {
 }
 
 
+/// io uring descriptor
 pub struct IoUring {
     fd: libc::c_int,
     sq: SQ,
@@ -146,6 +137,53 @@ struct io_uring_params {
     cq_off: io_cqring_offsets,
 }
 
+
+/// mmap helper, using the default protection and flags
+unsafe fn mmap(len: libc::size_t, fd: libc::c_int, off: libc::off_t) -> *mut libc::c_void {
+    let prot  = libc::PROT_READ | libc::PROT_WRITE;
+    let flags = libc::MAP_SHARED | libc::MAP_POPULATE;
+    let null = 0 as *mut libc::c_void;
+    libc::mmap(null, len, prot, flags, fd, off)
+}
+
+/// munmap helper
+///
+/// Prints a message at stder if munmap() returns an error.
+unsafe fn munmap(addr: *mut libc::c_void, len: libc::size_t) -> libc::c_int {
+        let err = libc::munmap(addr, len);
+        if err == 0 {
+            return err;
+        }
+        let errno_ptr = libc::__errno_location();
+        let old_errno = *errno_ptr;
+        let error = io::Error::from_raw_os_error(old_errno as i32);
+        // NB: not sure how to print a backtrace here. There does not seem to be a way using libstd
+        // that does not involve panic!
+        eprintln!("WARNING: munmap() failed: {}", error);
+        *errno_ptr = old_errno;
+        err
+}
+
+/// close helper
+///
+/// Prints a message at stderr if close() returns an error.
+unsafe fn close(fd: libc::c_int) -> libc::c_int {
+        let err = libc::close(fd);
+        if err == 0 {
+            return err;
+        }
+        let errno_ptr = libc::__errno_location();
+        let old_errno = *errno_ptr;
+        let error = io::Error::from_raw_os_error(old_errno as i32);
+        // NB: not sure how to print a backtrace here. There does not seem to be a way using libstd
+        // that does not involve panic!
+        eprintln!("WARNING: close() failed: {}", error);
+        *errno_ptr = old_errno;
+        err
+}
+
+
+/// io_uring_register syscall wrapper
 unsafe fn io_uring_register(
     fd: libc::c_int,
     opcode: libc::c_uint,
@@ -155,12 +193,14 @@ unsafe fn io_uring_register(
     libc::syscall(SYS_io_uring_register, fd, opcode, arg, nr_args)
 }
 
+/// io_uring_setup syscall wrapper
 unsafe fn io_uring_setup(entries: libc::c_uint, params: *mut io_uring_params)
 -> libc::c_int {
     let ret = libc::syscall(SYS_io_uring_setup, entries, params);
     libc::c_int::try_from(ret).unwrap_or(-1)
 }
 
+/// io_uring_enter syscall wrapper
 unsafe fn io_uring_enter(
     fd: libc::c_int,
     to_submit: libc::c_uint,
@@ -168,8 +208,8 @@ unsafe fn io_uring_enter(
     flags: libc::c_uint,
     sigset: *mut libc::sigset_t)
 -> libc::c_long {
-    // NB: From looking at the kernel code, the sigset size needs to match the kernel sigset size,
-    // which I guess is different from sizeof(sigset_t) in userspace.
+    // NB: From looking at the kernel and liburing code, the sigset size needs to match the kernel
+    // sigset size, which I guess is different from sizeof(sigset_t) in userspace.
     //
     // References:
     //  liburing io_uring_enter wrapper
@@ -192,6 +232,7 @@ unsafe fn io_uring_enter(
 
 impl IoUring {
 
+    /// initialize an io uring
     pub fn init(nentries: libc::c_uint) -> io::Result<IoUring> {
 
         let mut params: io_uring_params = unsafe { std::mem::zeroed() };
@@ -209,12 +250,10 @@ impl IoUring {
 
         let err = ret.queue_mmap(&mut params);
         if err.is_err() {
-            unsafe { libc::close(ret.fd); }
+            unsafe { close(ret.fd); }
         }
         Ok(ret)
     }
-
-
 
     fn queue_mmap(&mut self, p: &mut io_uring_params) -> io::Result<()> {
 
@@ -240,7 +279,7 @@ impl IoUring {
 
         // mmap the submission queue structure
         let sq_ring_ptr = {
-            let ptr = mmap(sq_ring_sz, self.fd, IORING_OFF_SQ_RING);
+            let ptr = unsafe { mmap(sq_ring_sz, self.fd, IORING_OFF_SQ_RING) };
             if ptr == libc::MAP_FAILED {
                 return Err(io::Error::last_os_error())
             }
@@ -255,9 +294,9 @@ impl IoUring {
 
         // mmap the submission queue entries array
         let sqes_ptr = {
-            let sqp = mmap(sqes_size, self.fd, IORING_OFF_SQES);
+            let sqp = unsafe { mmap(sqes_size, self.fd, IORING_OFF_SQES) };
             if sqp == libc::MAP_FAILED {
-                unsafe { libc::munmap(sq_ring_ptr, sq_ring_sz) };
+                unsafe { munmap(sq_ring_ptr, sq_ring_sz) };
                 return Err(io::Error::last_os_error());
             }
             sqp as *mut io_uring_sqe
@@ -299,11 +338,11 @@ impl IoUring {
         };
 
         let cq_ring_ptr  = {
-            let ptr = mmap(cq_ring_sz, self.fd, IORING_OFF_CQ_RING);
+            let ptr = unsafe { mmap(cq_ring_sz, self.fd, IORING_OFF_CQ_RING) };
             if ptr == libc::MAP_FAILED {
                 unsafe {
-                    libc::munmap(sq_ring_ptr, sq_ring_sz);
-                    libc::munmap(sqes_ptr as *mut libc::c_void, sqes_size);
+                    munmap(sq_ring_ptr, sq_ring_sz);
+                    munmap(sqes_ptr as *mut libc::c_void, sqes_size);
                 }
                 return Err(io::Error::last_os_error())
             }
@@ -326,5 +365,27 @@ impl IoUring {
         };
 
         Ok(())
+    }
+
+    fn queue_unmap(&mut self) {
+        let sqes_size = {
+            let nentries_ = unsafe { *self.sq.kring_entries };
+            let nentries = libc::size_t::try_from(nentries_).unwrap();
+            let esz = libc::size_t::try_from(mem::size_of::<io_uring_sqe>()).unwrap();
+            nentries*esz
+        };
+        unsafe {
+            munmap(self.sq.ring_ptr, self.sq.ring_sz);
+            munmap(self.sq.sqes as *mut libc::c_void, sqes_size);
+            munmap(self.cq.ring_ptr, self.cq.ring_sz);
+        }
+    }
+
+}
+
+impl Drop for IoUring {
+    fn drop(&mut self) {
+        self.queue_unmap();
+        unsafe { close(self.fd) };
     }
 }
