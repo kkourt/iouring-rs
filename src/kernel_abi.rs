@@ -8,7 +8,11 @@
 
 use libc::c_long;
 
+#[allow(non_upper_case_globals)]
 pub const SYS_epoll_create: c_long = 213;
+#[allow(non_upper_case_globals)]
 pub const SYS_io_uring_register: c_long = 427;
+#[allow(non_upper_case_globals)]
 pub const SYS_io_uring_enter: c_long = 426;
+#[allow(non_upper_case_globals)]
 pub const SYS_io_uring_setup: c_long = 425;

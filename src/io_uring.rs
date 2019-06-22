@@ -4,16 +4,34 @@
 // vim: set expandtab softtabstop=4 tabstop=4 shiftwidth=4:
 //
 
+// This code used liburing (git://git.kernel.dk/liburing) as a reference.
+//
+// TODO:
+//  - do the cp example
+//  - a configuration to pass to init()
+
 use libc;
 use std::mem;
 use std::io;
 use std::convert::TryFrom;
+
+use backtrace::Backtrace;
 
 use crate::kernel_abi::{
     SYS_io_uring_register,
     SYS_io_uring_enter,
     SYS_io_uring_setup
 };
+
+
+/// io uring descriptor
+pub struct IoUring {
+    fd: libc::c_int,
+    sq: SQ,
+    cq: CQ,
+}
+
+pub struct SQEntry(*mut io_uring_sqe);
 
 /*
  * Magic offsets for the application to mmap the data it needs
@@ -54,13 +72,6 @@ struct CQ {
     ring_ptr: *mut libc::c_void,
 }
 
-
-/// io uring descriptor
-pub struct IoUring {
-    fd: libc::c_int,
-    sq: SQ,
-    cq: CQ,
-}
 
 type KernelRwf = libc::c_int;
 
@@ -154,12 +165,13 @@ unsafe fn munmap(addr: *mut libc::c_void, len: libc::size_t) -> libc::c_int {
         if err == 0 {
             return err;
         }
+        let bt = Backtrace::new();
         let errno_ptr = libc::__errno_location();
         let old_errno = *errno_ptr;
         let error = io::Error::from_raw_os_error(old_errno as i32);
         // NB: not sure how to print a backtrace here. There does not seem to be a way using libstd
         // that does not involve panic!
-        eprintln!("WARNING: munmap() failed: {}", error);
+        eprintln!("WARNING: munmap() failed: {}\nBacktrace:\n{:?}", error, bt);
         *errno_ptr = old_errno;
         err
 }
@@ -172,12 +184,13 @@ unsafe fn close(fd: libc::c_int) -> libc::c_int {
         if err == 0 {
             return err;
         }
+        let bt = Backtrace::new();
         let errno_ptr = libc::__errno_location();
         let old_errno = *errno_ptr;
         let error = io::Error::from_raw_os_error(old_errno as i32);
         // NB: not sure how to print a backtrace here. There does not seem to be a way using libstd
         // that does not involve panic!
-        eprintln!("WARNING: close() failed: {}", error);
+        eprintln!("WARNING: close() failed: {}\nBacktrace:\n{:?}", error, bt);
         *errno_ptr = old_errno;
         err
 }
@@ -230,11 +243,14 @@ unsafe fn io_uring_enter(
     libc::syscall(SYS_io_uring_enter, fd, to_submit, min_complete, flags, sigset, sigset_size)
 }
 
+impl SQEntry {
+    fn is_valid(&self) -> bool { return true; }
+}
+
 impl IoUring {
 
     /// initialize an io uring
     pub fn init(nentries: libc::c_uint) -> io::Result<IoUring> {
-
         let mut params: io_uring_params = unsafe { std::mem::zeroed() };
         let params_p = &mut params as *mut io_uring_params;
         let fd = unsafe { io_uring_setup(nentries, params_p) };
@@ -253,6 +269,10 @@ impl IoUring {
             unsafe { close(ret.fd); }
         }
         Ok(ret)
+    }
+
+    pub unsafe fn get_sqe() -> Option<SQEntry> {
+        unimplemented!()
     }
 
     fn queue_mmap(&mut self, p: &mut io_uring_params) -> io::Result<()> {
@@ -388,4 +408,44 @@ impl Drop for IoUring {
         self.queue_unmap();
         unsafe { close(self.fd) };
     }
+}
+
+pub enum FillRet<E,R> {
+    QueueFull,
+    InvalidFill,
+    Ret(Result<E,R>),
+}
+
+impl IoUring {
+
+
+    /// Fill the next SQEntry in the queue via the provided function
+    pub fn fill_sqe<F, E, R>(&mut self, fill: F) -> FillRet<E,R>
+    where F: FnOnce(&mut SQEntry) -> Result<E,R> {
+        let sq = &mut self.sq;
+        let next: u32 = sq.sqe_tail + 1;
+        let nentries: u32 = unsafe { *sq.kring_entries };
+        if next - sq.sqe_head > nentries {
+            return FillRet::QueueFull;
+        }
+
+        let mut sqe = {
+            let mask = unsafe { *sq.kring_mask };
+            let idx = sq.sqe_tail & mask;
+            let sqe_p = unsafe { sq.sqes.offset(idx as isize) };
+            SQEntry(sqe_p)
+        };
+
+        let fret = fill(&mut sqe);
+        if !sqe.is_valid() {
+            return FillRet::InvalidFill;
+        }
+
+        if fret.is_ok() {
+            sq.sqe_tail = next;
+        }
+
+        FillRet::Ret(fret)
+    }
+
 }

@@ -1,8 +1,7 @@
+#![allow(dead_code)]
 
-mod io_uring;
+pub mod io_uring;
 mod kernel_abi;
-
-
 
 #[cfg(test)]
 mod tests {
@@ -13,7 +12,6 @@ mod tests {
 
     #[test]
     fn hello() {
-        println!("*************** Hello World!");
         let res = crate::io_uring::IoUring::init(4);
     }
 }
