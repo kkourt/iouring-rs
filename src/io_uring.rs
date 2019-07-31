@@ -5,6 +5,7 @@
 //
 
 // This code used liburing (git://git.kernel.dk/liburing) as a reference.
+// ALSO: kernel.dk/io_uring.pdf
 //
 // TODO:
 //  - do the cp example
@@ -88,6 +89,19 @@ union io_uring_sqe_idx {
     buf_index: u16,
     __pad2: [u64; 3],
 }
+
+const IORING_OP_NOP             : u8 = 0;
+const IORING_OP_READV           : u8 = 1;
+const IORING_OP_WRITEV          : u8 = 2;
+const IORING_OP_FSYNC           : u8 = 3;
+const IORING_OP_READ_FIXED      : u8 = 4;
+const IORING_OP_WRITE_FIXED     : u8 = 5;
+const IORING_OP_POLL_ADD        : u8 = 6;
+const IORING_OP_POLL_REMOVE     : u8 = 7;
+const IORING_OP_SYNC_FILE_RANGE : u8 = 8;
+const IORING_OP_SENDMSG         : u8 = 9;
+const IORING_OP_RECVMSG         : u8 = 10;
+const IORING_OP_INVALID         : u8 = 250; // Not part of the ABI, used internally
 
 #[repr(C)]
 struct io_uring_sqe {
@@ -176,7 +190,7 @@ unsafe fn munmap(addr: *mut libc::c_void, len: libc::size_t) -> libc::c_int {
         err
 }
 
-/// close helper
+/// close() helper
 ///
 /// Prints a message at stderr if close() returns an error.
 unsafe fn close(fd: libc::c_int) -> libc::c_int {
@@ -244,7 +258,21 @@ unsafe fn io_uring_enter(
 }
 
 impl SQEntry {
-    fn is_valid(&self) -> bool { return true; }
+    fn reset(&mut self) {
+        let ptr = self.0;
+        unsafe { *ptr =  mem::zeroed() };
+    }
+
+    fn prep_rw(&mut self, op: u8, fd: libc::c_int, buff: *const libc::c_void, len: u32, off: u64) {
+        let sqe: &mut io_uring_sqe = unsafe { &mut *self.0 };
+        sqe.opcode = op;
+        sqe.fd = fd;
+        sqe.off = off;
+        sqe.addr = buff as u64;
+        sqe.len = len;
+    }
+
+    pub fn prep_readv(
 }
 
 impl IoUring {
@@ -269,10 +297,6 @@ impl IoUring {
             unsafe { close(ret.fd); }
         }
         Ok(ret)
-    }
-
-    pub unsafe fn get_sqe() -> Option<SQEntry> {
-        unimplemented!()
     }
 
     fn queue_mmap(&mut self, p: &mut io_uring_params) -> io::Result<()> {
@@ -410,23 +434,20 @@ impl Drop for IoUring {
     }
 }
 
-pub enum FillRet<E,R> {
-    QueueFull,
-    InvalidFill,
-    Ret(Result<E,R>),
-}
-
 impl IoUring {
-
-
     /// Fill the next SQEntry in the queue via the provided function
-    pub fn fill_sqe<F, E, R>(&mut self, fill: F) -> FillRet<E,R>
+    ///
+    /// Returns:
+    ///  None: queue is full (fill function was not executed)
+    ///  Some(Err(x)): fill function returned Err(x), queue was not updated
+    ///  Some(Err(x)): fill function returned Ok(x), queue was updated
+    pub fn fill_sqe<F, E, R>(&mut self, fill: F) -> Option<Result<E,R>>
     where F: FnOnce(&mut SQEntry) -> Result<E,R> {
         let sq = &mut self.sq;
         let next: u32 = sq.sqe_tail + 1;
         let nentries: u32 = unsafe { *sq.kring_entries };
         if next - sq.sqe_head > nentries {
-            return FillRet::QueueFull;
+            return None
         }
 
         let mut sqe = {
@@ -435,17 +456,19 @@ impl IoUring {
             let sqe_p = unsafe { sq.sqes.offset(idx as isize) };
             SQEntry(sqe_p)
         };
+        sqe.reset();
 
         let fret = fill(&mut sqe);
-        if !sqe.is_valid() {
-            return FillRet::InvalidFill;
-        }
-
         if fret.is_ok() {
+            // update tail to commit new entry
             sq.sqe_tail = next;
         }
 
-        FillRet::Ret(fret)
+        Some(fret)
+    }
+
+    pub unsafe fn get_sqe() -> Option<SQEntry> {
+        unimplemented!()
     }
 
 }
