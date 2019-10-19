@@ -4,8 +4,9 @@
 // vim: set expandtab softtabstop=4 tabstop=4 shiftwidth=4:
 //
 
-// This code used liburing (git://git.kernel.dk/liburing) as a reference.
-// ALSO: kernel.dk/io_uring.pdf
+// Reference:
+// kernel.dk/io_uring.pdf
+// git://git.kernel.dk/liburing
 //
 // TODO:
 //  - do the cp example
@@ -18,11 +19,15 @@ use std::convert::TryFrom;
 
 use backtrace::Backtrace;
 
-use crate::kernel_abi::{
-    SYS_io_uring_register,
-    SYS_io_uring_enter,
-    SYS_io_uring_setup
-};
+/*
+ * Syscall numbers for io_uring
+ */
+#[allow(non_upper_case_globals)]
+pub const SYS_io_uring_register: libc::c_long = 427;
+#[allow(non_upper_case_globals)]
+pub const SYS_io_uring_enter: libc::c_long = 426;
+#[allow(non_upper_case_globals)]
+pub const SYS_io_uring_setup: libc::c_long = 425;
 
 
 /// io uring descriptor
@@ -236,7 +241,7 @@ unsafe fn io_uring_enter(
     sigset: *mut libc::sigset_t)
 -> libc::c_long {
     // NB: From looking at the kernel and liburing code, the sigset size needs to match the kernel
-    // sigset size, which I guess is different from sizeof(sigset_t) in userspace.
+    // sigset size, which AFICT is different from sizeof(sigset_t) in userspace.
     //
     // References:
     //  liburing io_uring_enter wrapper
@@ -272,7 +277,7 @@ impl SQEntry {
         sqe.len = len;
     }
 
-    pub fn prep_readv(
+    //pub fn prep_readv(
 }
 
 impl IoUring {

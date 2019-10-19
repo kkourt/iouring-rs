@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 pub mod io_uring;
-mod kernel_abi;
 
 #[cfg(test)]
 mod tests {
@@ -14,4 +13,6 @@ mod tests {
     fn hello() {
         let res = crate::io_uring::IoUring::init(4);
     }
+
+
 }
