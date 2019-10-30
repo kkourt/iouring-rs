@@ -1,9 +1,10 @@
 [package]
-name = "ll_linuxio"
-version = "0.1.0"
+name = "iouring"
+version = "0.0.1"
 authors = ["Kornilios Kourtis <kkourt@kkourt.io>"]
 edition = "2018"
 
 [dependencies]
 libc = "0.2"
 backtrace = "0.3"
+bitflags = "1.2"

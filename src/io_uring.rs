@@ -10,14 +10,22 @@
 //
 // TODO:
 //  - do the cp example
+//  - port all io_uring_prep functions from liburing.h
 //  - a configuration to pass to init()
+//
 
 use libc;
 use std::mem;
 use std::io;
-use std::convert::TryFrom;
+use std::convert::{TryFrom,TryInto};
+
+// use std::os::unix::io::{RawFd};
 
 use backtrace::Backtrace;
+
+/**
+ * io_uring ABI
+ */
 
 /*
  * Syscall numbers for io_uring
@@ -29,16 +37,6 @@ pub const SYS_io_uring_enter: libc::c_long = 426;
 #[allow(non_upper_case_globals)]
 pub const SYS_io_uring_setup: libc::c_long = 425;
 
-
-/// io uring descriptor
-pub struct IoUring {
-    fd: libc::c_int,
-    sq: SQ,
-    cq: CQ,
-}
-
-pub struct SQEntry(*mut io_uring_sqe);
-
 /*
  * Magic offsets for the application to mmap the data it needs
  */
@@ -46,43 +44,16 @@ const IORING_OFF_SQ_RING: i64 = 0;
 const IORING_OFF_CQ_RING: i64 = 0x08000000;
 const IORING_OFF_SQES:    i64 = 0x10000000;
 
-/// Submission queue
-struct SQ {
-    khead: *mut u32,
-    ktail: *mut u32,
-    kring_mask: *mut u32,
-    kring_entries: *mut u32,
-    kflags: *mut u32,
-    kdropped: *mut u32,
-    array: *mut u32,
-
-    sqes: *mut io_uring_sqe,
-    sqe_head: u32,
-    sqe_tail: u32,
-
-    ring_sz: libc::size_t,
-    ring_ptr: *mut libc::c_void,
-}
-
-/// Completion queue
-struct CQ {
-    khead: *mut u32,
-    ktail: *mut u32,
-    kring_mask: *mut u32,
-    kring_entries: *mut u32,
-    overflow: *mut u32,
-
-    cqes: *mut io_uring_sqe,
-
-    ring_sz: libc::size_t,
-    ring_ptr: *mut libc::c_void,
-}
-
 
 type KernelRwf = libc::c_int;
 
+// NB: There seems to be an RFC for anonymous unions, which might make declaring all these unions
+// more concise, but it does not to be implemented as of now:
+// - https://github.com/rust-lang/rfcs/pull/2102
+// - https://github.com/rust-lang/rust/issues/49804
+
 #[repr(C)]
-union io_uring_sqe_arg {
+union io_uring_sqe_args {
     rw_flags: KernelRwf,
     fsync_flags: u32,
     poll_events: u16,
@@ -108,6 +79,36 @@ const IORING_OP_SENDMSG         : u8 = 9;
 const IORING_OP_RECVMSG         : u8 = 10;
 const IORING_OP_INVALID         : u8 = 250; // Not part of the ABI, used internally
 
+bitflags::bitflags!{
+    struct SqeFlags: u8 {
+        const FIXED_FILE    = 1 << 0; // use fixed fileset
+        const IO_DRAIN      = 1 << 1; // issue after inflight IO
+        const IO_LINK       = 1 << 2; // links next sqe
+    }
+}
+
+bitflags::bitflags!{
+    struct SetupFlags: u32 {
+        const IOPOLL = 1 << 0; // io_context is polled
+        const SQPOLL = 1 << 1; // SQ poll thread
+        const SQ_AFF = 1 << 2; // sq_thread_cpu is valid
+        const CQSIZE = 1 << 3; // app defined CQ size
+    }
+}
+
+bitflags::bitflags!{
+    struct SQFlags: u32 {
+        const NEED_WAKEUP = 1 << 0; // needs io_uring_enter wakeup
+    }
+}
+
+bitflags::bitflags!{
+    struct EnterFlags: libc::c_uint {
+        const GETEVENTS = 1<<0;
+        const SQ_WAKEUP = 1<<1;
+    }
+}
+
 #[repr(C)]
 struct io_uring_sqe {
     opcode: u8,                /* type of operation for this sqe */
@@ -117,7 +118,7 @@ struct io_uring_sqe {
     off: u64,                  /* offset into file */
     addr: u64,                 /* pointer to buffer or iovecs */
     len: u32,                  /* buffer size or number of iovecs */
-    arg: io_uring_sqe_arg,
+    args: io_uring_sqe_args,
     user_data: u64,
     idx: io_uring_sqe_idx,
 }
@@ -167,53 +168,59 @@ struct io_uring_params {
     cq_off: io_cqring_offsets,
 }
 
+/**
+ * Library structures
+ */
 
-/// mmap helper, using the default protection and flags
-unsafe fn mmap(len: libc::size_t, fd: libc::c_int, off: libc::off_t) -> *mut libc::c_void {
-    let prot  = libc::PROT_READ | libc::PROT_WRITE;
-    let flags = libc::MAP_SHARED | libc::MAP_POPULATE;
-    let null = 0 as *mut libc::c_void;
-    libc::mmap(null, len, prot, flags, fd, off)
+/// Submission queue
+//
+// Most of the fields here are pointers to the mapped ring structure.
+struct SQ {
+    khead: *mut u32,
+    ktail: *mut u32,
+    kring_mask: *mut u32,
+    kring_entries: *mut u32,
+    kflags: *mut u32,
+    kdropped: *mut u32,
+    array: *mut u32,
+
+    sqes: *mut io_uring_sqe,
+    sqe_head: u32,
+    sqe_tail: u32,
+
+    ring_sz: libc::size_t,
+    ring_ptr: *mut libc::c_void,
 }
 
-/// munmap helper
-///
-/// Prints a message at stder if munmap() returns an error.
-unsafe fn munmap(addr: *mut libc::c_void, len: libc::size_t) -> libc::c_int {
-        let err = libc::munmap(addr, len);
-        if err == 0 {
-            return err;
-        }
-        let bt = Backtrace::new();
-        let errno_ptr = libc::__errno_location();
-        let old_errno = *errno_ptr;
-        let error = io::Error::from_raw_os_error(old_errno as i32);
-        // NB: not sure how to print a backtrace here. There does not seem to be a way using libstd
-        // that does not involve panic!
-        eprintln!("WARNING: munmap() failed: {}\nBacktrace:\n{:?}", error, bt);
-        *errno_ptr = old_errno;
-        err
+/// Completion queue
+struct CQ {
+    khead: *mut u32,
+    ktail: *mut u32,
+    kring_mask: *mut u32,
+    kring_entries: *mut u32,
+    overflow: *mut u32,
+
+    cqes: *mut io_uring_sqe,
+
+    ring_sz: libc::size_t,
+    ring_ptr: *mut libc::c_void,
 }
 
-/// close() helper
-///
-/// Prints a message at stderr if close() returns an error.
-unsafe fn close(fd: libc::c_int) -> libc::c_int {
-        let err = libc::close(fd);
-        if err == 0 {
-            return err;
-        }
-        let bt = Backtrace::new();
-        let errno_ptr = libc::__errno_location();
-        let old_errno = *errno_ptr;
-        let error = io::Error::from_raw_os_error(old_errno as i32);
-        // NB: not sure how to print a backtrace here. There does not seem to be a way using libstd
-        // that does not involve panic!
-        eprintln!("WARNING: close() failed: {}\nBacktrace:\n{:?}", error, bt);
-        *errno_ptr = old_errno;
-        err
+
+/// io uring descriptor
+pub struct IoUring {
+    fd: libc::c_int,
+    sq: SQ,
+    cq: CQ,
+    flags: SetupFlags,
 }
 
+pub struct SQEntry(*mut io_uring_sqe);
+
+
+/**
+ * Syscall wrappers
+ */
 
 /// io_uring_register syscall wrapper
 unsafe fn io_uring_register(
@@ -262,24 +269,127 @@ unsafe fn io_uring_enter(
     libc::syscall(SYS_io_uring_enter, fd, to_submit, min_complete, flags, sigset, sigset_size)
 }
 
+
+/**
+ * Misc helpers
+ */
+
+/// mmap helper, using the default protection and flags
+unsafe fn mmap(len: libc::size_t, fd: libc::c_int, off: libc::off_t) -> *mut libc::c_void {
+    let prot  = libc::PROT_READ | libc::PROT_WRITE;
+    let flags = libc::MAP_SHARED | libc::MAP_POPULATE;
+    let null = 0 as *mut libc::c_void;
+    libc::mmap(null, len, prot, flags, fd, off)
+}
+
+/// munmap helper
+///
+/// Prints a message at stder if munmap() returns an error.
+unsafe fn munmap(addr: *mut libc::c_void, len: libc::size_t) -> libc::c_int {
+        let err = libc::munmap(addr, len);
+        if err == 0 {
+            return err;
+        }
+        let bt = Backtrace::new();
+        let errno_ptr = libc::__errno_location();
+        let old_errno = *errno_ptr;
+        let error = io::Error::from_raw_os_error(old_errno as i32);
+        // NB: not sure how to print a backtrace here. There does not seem to be a way using libstd
+        // that does not involve panic!
+        eprintln!("WARNING: munmap() failed: {}\nBacktrace:\n{:?}", error, bt);
+        *errno_ptr = old_errno;
+        err
+}
+
+/// close() helper
+///
+/// Prints a message at stderr if close() returns an error.
+unsafe fn close(fd: libc::c_int) -> libc::c_int {
+        let err = libc::close(fd);
+        if err == 0 {
+            return err;
+        }
+
+        // Not match we can do in case of an error here. Just print a backtrace.
+        let bt = Backtrace::new();
+        let errno_ptr = libc::__errno_location();
+        let old_errno = *errno_ptr;
+        let error = io::Error::from_raw_os_error(old_errno as i32);
+        eprintln!("WARNING: close() failed: {}\nBacktrace:\n{:?}", error, bt);
+        *errno_ptr = old_errno;
+        err
+}
+
+/**
+ * Main implementation
+ */
+
 impl SQEntry {
     fn reset(&mut self) {
         let ptr = self.0;
         unsafe { *ptr =  mem::zeroed() };
     }
 
-    fn prep_rw(&mut self, op: u8, fd: libc::c_int, buff: *const libc::c_void, len: u32, off: u64) {
+    fn prep_rw(&mut self, op: u8, fd: libc::c_int, addr: *const libc::c_void, len: u32, off: u64) {
         let sqe: &mut io_uring_sqe = unsafe { &mut *self.0 };
-        sqe.opcode = op;
-        sqe.fd = fd;
-        sqe.off = off;
-        sqe.addr = buff as u64;
-        sqe.len = len;
+        *sqe = io_uring_sqe {
+            opcode: op,
+            flags: 0,
+            ioprio: 0,
+            fd: fd,
+            off: off,
+            addr: addr as u64,
+            args: io_uring_sqe_args { rw_flags: 0 },
+            user_data: 0,
+            len: len,
+            idx: io_uring_sqe_idx { __pad2: [0; 3] },
+        };
     }
 
-    //pub fn prep_readv(
+    pub fn set_data(&mut self, data: u64) {
+        let sqe: &mut io_uring_sqe = unsafe { &mut *self.0 };
+        sqe.user_data = data
+    }
+
+    pub fn prep_readv(&mut self, fd: libc::c_int, iovecs: *const libc::iovec, nr_vecs: u32, off: u64) {
+        let ptr = iovecs as *const libc::c_void;
+        self.prep_rw(IORING_OP_READV, fd, ptr, nr_vecs, off)
+    }
+
+    pub fn prep_writev(&mut self, fd: libc::c_int, iovecs: *const libc::iovec, nr_vecs: u32, off: u64) {
+        let ptr = iovecs as *const libc::c_void;
+        self.prep_rw(IORING_OP_READV, fd, ptr, nr_vecs, off)
+    }
+
+    /// This uses IoSlice, which is the buffer type ised in Write::write_vectored, and "is
+    /// guaranteed to be ABI compatible with the iovec type on Unix platforms"
+    //
+    // NB: https://github.com/rust-lang/rust/blob/7bf377f289a4f79829309ed69dccfe33f20b089c/src/libstd/sys/unix/fd.rs#L103
+    pub fn prep_write_slice(&mut self, fd: libc::c_int, bufs: &[std::io::IoSlice], off: u64) {
+        self.prep_writev(
+            fd,
+            bufs.as_ptr() as *const libc::iovec,
+            // NB: len() is usize, arg is u32. This will panic if a conversion cannot be made.
+            bufs.len().try_into().unwrap(),
+            off);
+    }
+
+    /// This uses IoSliceMut, which is the buffer type ised in Write::read_vectored, and "is
+    /// guaranteed to be ABI compatible with the iovec type on Unix platforms"
+    //
+    // NB: https://github.com/rust-lang/rust/blob/7bf377f289a4f79829309ed69dccfe33f20b089c/src/libstd/sys/unix/fd.rs#L56
+    pub fn prep_read_slice(&mut self, fd: libc::c_int, bufs: &[std::io::IoSliceMut], off: u64) {
+        self.prep_readv(
+            fd,
+            bufs.as_ptr() as *const libc::iovec,
+            // NB: len() is usize, arg is u32. This will panic if a conversion cannot be made.
+            bufs.len().try_into().unwrap(),
+            off);
+    }
+
 }
 
+/// setup functions
 impl IoUring {
 
     /// initialize an io uring
@@ -295,6 +405,8 @@ impl IoUring {
             fd: fd,
             sq: unsafe { std::mem::zeroed() },
             cq: unsafe { std::mem::zeroed() },
+            // NB: SetupFlags should be given by the user as an argument
+            flags: SetupFlags::from_bits(params.flags).unwrap(),
         };
 
         let err = ret.queue_mmap(&mut params);
@@ -318,6 +430,7 @@ impl IoUring {
          */
         let sq = &mut self.sq;
 
+        // From io_uring_setup(2):
         // The addition of sq_off.array to the length of the region accounts for the fact that the
         // ring located at the end of the data structure.
         let sq_ring_sz  = {
@@ -430,6 +543,7 @@ impl IoUring {
         }
     }
 
+
 }
 
 impl Drop for IoUring {
@@ -439,15 +553,14 @@ impl Drop for IoUring {
     }
 }
 
+
+// queue functions: SQ
 impl IoUring {
-    /// Fill the next SQEntry in the queue via the provided function
+
+    /// Get a new submission queue entry (sqe)
     ///
-    /// Returns:
-    ///  None: queue is full (fill function was not executed)
-    ///  Some(Err(x)): fill function returned Err(x), queue was not updated
-    ///  Some(Err(x)): fill function returned Ok(x), queue was updated
-    pub fn fill_sqe<F, E, R>(&mut self, fill: F) -> Option<Result<E,R>>
-    where F: FnOnce(&mut SQEntry) -> Result<E,R> {
+    /// If queue is full, return None
+    pub fn get_sqe(&mut self) -> Option<SQEntry> {
         let sq = &mut self.sq;
         let next: u32 = sq.sqe_tail + 1;
         let nentries: u32 = unsafe { *sq.kring_entries };
@@ -455,25 +568,165 @@ impl IoUring {
             return None
         }
 
-        let mut sqe = {
-            let mask = unsafe { *sq.kring_mask };
-            let idx = sq.sqe_tail & mask;
-            let sqe_p = unsafe { sq.sqes.offset(idx as isize) };
-            SQEntry(sqe_p)
-        };
-        sqe.reset();
+        let mask = unsafe { *sq.kring_mask };
+        let idx = sq.sqe_tail & mask;
+        let sqe_p = unsafe { sq.sqes.offset(idx as isize) };
 
-        let fret = fill(&mut sqe);
-        if fret.is_ok() {
-            // update tail to commit new entry
-            sq.sqe_tail = next;
+        sq.sqe_tail = next;
+        Some(SQEntry(sqe_p))
+    }
+
+    /// Returns: sqes submited
+    // liburing: __io_uring_flush_sq()
+    fn flush_sq(&mut self) -> u32 {
+        let sq = &mut self.sq;
+
+        // NB: This works even if there is an overflow on sqe_{tail,head}
+        let to_submit = sq.sqe_tail - sq.sqe_head;
+        if to_submit == 0 {
+            return 0
         }
 
-        Some(fret)
+        let mask = unsafe { *sq.kring_mask };
+        let mut ktail = unsafe { *sq.ktail };
+        let mut submitted = 0;
+        loop  {
+            // I don't see how this can overflow isize, so skip the runtime test
+            let aoff = (ktail & mask) as isize;
+            unsafe {
+                *sq.array.offset(aoff) = sq.sqe_head & mask;
+            }
+            sq.sqe_head += 1;
+            ktail += 1;
+            submitted += 1;
+
+            if submitted == to_submit {
+                break;
+            }
+        }
+
+        // Ensure that the queue consumer (kernel) to see the updated sqe entries before any
+        // updates to the tail.
+        //
+        // NB: not sure if there is a better way to do this than the cast here, but AtomicU32
+        // documentation says that: "This type has the same in-memory representation as the
+        // underlying integer type, u32."
+        let ktail_p = sq.ktail as *mut std::sync::atomic::AtomicU32;
+        unsafe {
+            (&*ktail_p).store(ktail, std::sync::atomic::Ordering::Release);
+        }
+
+        submitted
     }
 
-    pub unsafe fn get_sqe() -> Option<SQEntry> {
-        unimplemented!()
+    // Returns:
+    // None -> No need to enter for the SQ (this will happen when SQPOLL is defined)
+    // Some(flags) -> you need to enter for the SQ, please use the following flags
+    //
+    fn sq_ring_needs_enter(&mut self) -> Option<EnterFlags> {
+
+        if !self.flags.contains(SetupFlags::SQPOLL) {
+            return Some(EnterFlags::empty())
+        }
+
+        let need_wakeup = unsafe {
+            let flags = std::ptr::read_volatile(self.sq.kflags);
+            SQFlags::from_bits_unchecked(flags).contains(SQFlags::NEED_WAKEUP)
+        };
+        if need_wakeup {
+            return Some(EnterFlags::SQ_WAKEUP);
+        }
+
+        None
     }
 
+    // liburing: __io_uring_submit()
+    fn do_submit(&mut self, submitted: u32, mut wait_nr: u32) -> std::io::Result<u32> {
+
+        let flags = match (wait_nr, self.sq_ring_needs_enter()) {
+            (0, None) => {
+                // No need to issue system call, just return
+                return Ok(submitted);
+            },
+            (0, Some(x)) => x,
+            (_, None) => EnterFlags::GETEVENTS,
+            (_, Some(mut x)) => {
+                x.set(EnterFlags::GETEVENTS, true);
+                x
+            }
+        };
+
+        // NB: I guess liburing truncates wait_nr to submitted to avoid the case of sleeping
+        // forever, even though waiting for more than you submit might be valid if you previously
+        // submitted without waiting.
+        if wait_nr > submitted {
+            wait_nr = submitted;
+        }
+
+        let null = 0 as *mut libc::sigset_t;
+        let ret = unsafe {
+            io_uring_enter(self.fd, submitted, wait_nr, flags.bits(), null)
+        };
+
+        if ret < 0 {
+            // wrap errno
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(ret as u32)
+        }
+    }
+
+    // liburing: __io_uring_submit_and_wait
+    fn do_submit_and_wait(&mut self, wait_nr: u32) -> std::io::Result<u32> {
+        let submitted = self.flush_sq();
+        if submitted > 0 {
+            return self.do_submit(submitted, wait_nr)
+        }
+        Ok(0)
+    }
+
+    /// Submit sqes acquired via get_sqe() to the kernel.
+    ///
+    /// Returns number of sqes submitted, or error if io_uring_enter() failed.
+    pub fn submit(&mut self) -> std::io::Result<u32> {
+        self.do_submit_and_wait(0)
+    }
+}
+
+// queue functions: CQ
+impl IoUring {
+}
+
+impl IoUring {
+    // /// Fill the next SQEntry in the queue via the provided function.
+    // ///
+    // /// Returns:
+    // ///  None: queue is full (fill function was not executed)
+    // ///  Some(Err(x)): fill function returned Err(x), queue was not updated
+    // ///  Some(Err(x)): fill function returned Ok(x), queue was updated
+    // pub fn fill_next_sqe<F, E, R>(&mut self, fill: F) -> Option<Result<E,R>>
+    // where F: FnOnce(&mut SQEntry) -> Result<E,R> {
+    //     let sq = &mut self.sq;
+    //     let next: u32 = sq.sqe_tail + 1;
+    //     let nentries: u32 = unsafe { *sq.kring_entries };
+    //     if next - sq.sqe_head > nentries {
+    //         return None
+    //     }
+
+    //     let mut sqe = {
+    //         let mask = unsafe { *sq.kring_mask };
+    //         let idx = sq.sqe_tail & mask;
+    //         let sqe_p = unsafe { sq.sqes.offset(idx as isize) };
+    //         SQEntry(sqe_p)
+    //     };
+    //     sqe.reset();
+
+    //     let fret = fill(&mut sqe);
+    //     if fret.is_ok() {
+    //         // update tail to commit new entry
+    //         sq.sqe_tail = next;
+    //     }
+
+    //     Some(fret)
+    // }
 }

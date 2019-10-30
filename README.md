@@ -1,18 +1,14 @@
 # ll_linuxio
 
-A Rust library for using Linux IO facilities in Rust
-
-The first thing I want to implement is io_uring, and then move to epoll,
-userfaultfd, or others.
-
+A Rust library for using Linux io_uring.
 
 # Notes
 
-For `io_uring`, my implementation tries to follow `liburing`, but operates
-directly on the kernel ABI. Implementing bindings to `liburing` might have been
-a more "productive" approach, but not as interesting for me.
+This implementation operates directly on the kernel ABI, while trying to follow
+the [liburing](https://github.com/axboe/liburing) implementation. The goal is to
+understand the `io_uring` facility and how to write low-level code with Rust.
 
-# References
-
-- There seems to be another `io_uring` implementation in Rust:
-  https://github.com/quininer/linux-io-uring but I have not looked into it.
+Implementing bidings to `liburing` is probably a better choice in the long run,
+while there seems to be at least one more Rust
+[implementation](https://github.com/quininer/linux-io-uring) that operates
+directly on the kernel ABI.
