@@ -123,13 +123,13 @@ struct io_uring_sqe {
     idx: io_uring_sqe_idx,
 }
 
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
-struct io_uring_cqe {
+pub struct io_uring_cqe {
     user_data: u64,   /* sqe->data submission passed back */
     res: i32,         /* result code for this event */
     flags: u32,
 }
-
 
 #[repr(C)]
 struct io_sqring_offsets {
@@ -185,8 +185,9 @@ struct SQ {
     array: *mut u32,
 
     sqes: *mut io_uring_sqe,
-    sqe_head: u32,
-    sqe_tail: u32,
+    // NB: the ring depends on wrapping behavior for working correctly.
+    sqe_head: std::num::Wrapping<u32>,
+    sqe_tail: std::num::Wrapping<u32>,
 
     ring_sz: libc::size_t,
     ring_ptr: *mut libc::c_void,
@@ -200,10 +201,15 @@ struct CQ {
     kring_entries: *mut u32,
     overflow: *mut u32,
 
-    cqes: *mut io_uring_sqe,
+    cqes: *mut io_uring_cqe,
 
     ring_sz: libc::size_t,
     ring_ptr: *mut libc::c_void,
+}
+
+pub struct CqIter<'a> {
+    curr: std::num::Wrapping<u32>, // current index for the iterator
+    cq: &'a CQ,
 }
 
 
@@ -478,8 +484,8 @@ impl IoUring {
                 kdropped      : ptr_off(ptr, off.dropped),
                 array         : ptr_off(ptr, off.array),
                 sqes          : sqes_ptr,
-                sqe_head      : 0,
-                sqe_tail      : 0,
+                sqe_head      : std::num::Wrapping(0),
+                sqe_tail      : std::num::Wrapping(0),
                 ring_sz       : sq_ring_sz,
                 ring_ptr      : ptr,
             }
@@ -520,7 +526,7 @@ impl IoUring {
                 kring_mask: ptr_off(ptr, off.ring_mask),
                 kring_entries: ptr_off(ptr, off.ring_entries),
                 overflow: ptr_off(ptr, off.overflow),
-                cqes: ptr_off(ptr, off.cqes) as *mut io_uring_sqe,
+                cqes: ptr_off(ptr, off.cqes) as *mut io_uring_cqe,
                 ring_sz: cq_ring_sz,
                 ring_ptr: ptr
             }
@@ -562,14 +568,14 @@ impl IoUring {
     /// If queue is full, return None
     pub fn get_sqe(&mut self) -> Option<SQEntry> {
         let sq = &mut self.sq;
-        let next: u32 = sq.sqe_tail + 1;
+        let next = sq.sqe_tail + std::num::Wrapping(1);
         let nentries: u32 = unsafe { *sq.kring_entries };
-        if next - sq.sqe_head > nentries {
+        if (next - sq.sqe_head).0 > nentries {
             return None
         }
 
         let mask = unsafe { *sq.kring_mask };
-        let idx = sq.sqe_tail & mask;
+        let idx = sq.sqe_tail.0 & mask;
         let sqe_p = unsafe { sq.sqes.offset(idx as isize) };
 
         sq.sqe_tail = next;
@@ -582,22 +588,22 @@ impl IoUring {
         let sq = &mut self.sq;
 
         // NB: This works even if there is an overflow on sqe_{tail,head}
-        let to_submit = sq.sqe_tail - sq.sqe_head;
+        let to_submit = (sq.sqe_tail - sq.sqe_head).0;
         if to_submit == 0 {
             return 0
         }
 
         let mask = unsafe { *sq.kring_mask };
-        let mut ktail = unsafe { *sq.ktail };
+        let mut ktail = std::num::Wrapping( {unsafe { *sq.ktail }} );
         let mut submitted = 0;
         loop  {
             // I don't see how this can overflow isize, so skip the runtime test
-            let aoff = (ktail & mask) as isize;
+            let aoff = (ktail.0 & mask) as isize;
             unsafe {
-                *sq.array.offset(aoff) = sq.sqe_head & mask;
+                *sq.array.offset(aoff) = sq.sqe_head.0 & mask;
             }
-            sq.sqe_head += 1;
-            ktail += 1;
+            sq.sqe_head += std::num::Wrapping(1);
+            ktail += std::num::Wrapping(1);
             submitted += 1;
 
             if submitted == to_submit {
@@ -613,7 +619,7 @@ impl IoUring {
         // underlying integer type, u32."
         let ktail_p = sq.ktail as *mut std::sync::atomic::AtomicU32;
         unsafe {
-            (&*ktail_p).store(ktail, std::sync::atomic::Ordering::Release);
+            (&*ktail_p).store(ktail.0, std::sync::atomic::Ordering::Release);
         }
 
         submitted
@@ -695,6 +701,35 @@ impl IoUring {
 
 // queue functions: CQ
 impl IoUring {
+    pub fn cq_iter(&self) -> CqIter {
+        let cq_head = unsafe { *self.sq.khead };
+        CqIter {
+            curr: std::num::Wrapping(cq_head),
+            cq: &self.cq,
+        }
+    }
+}
+
+impl<'a> Iterator for CqIter<'a> {
+    type Item = io_uring_cqe;
+
+    fn next(&mut self) -> Option<io_uring_cqe> {
+        let ktail_p = self.cq.ktail as *mut std::sync::atomic::AtomicU32;
+        let tail_ = unsafe { (&*ktail_p).load(std::sync::atomic::Ordering::Acquire) };
+        let tail = std::num::Wrapping(tail_);
+        if self.curr == tail {
+            return None
+        }
+
+        let mask = unsafe { *self.cq.kring_mask };
+        let idx = self.curr.0 & mask;
+        let cqe: io_uring_cqe = unsafe {
+            *self.cq.cqes.offset(idx as isize)
+        };
+        self.curr += std::num::Wrapping(1);
+        Some(cqe)
+
+    }
 }
 
 impl IoUring {
